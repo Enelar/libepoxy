@@ -114,7 +114,7 @@
  *      3.6. To perform the dynamic query, libGL also must export an entry
  *           point called
  *
- *           void (*glXGetProcAddressARB(const GLubyte *))(); 
+ *           void (*glXGetProcAddressARB(const GLubyte *))();
  *
  *      The full specification of this function is available separately. It
  *      takes the string name of a GL or GLX entry point and returns a pointer
@@ -173,10 +173,14 @@
 
 #include "dispatch_common.h"
 
+#define LIB_NAME_MAX 30
+
 #ifdef __APPLE__
 #define GLX_LIB "/opt/X11/lib/libGL.1.dylib"
 #elif defined(ANDROID)
 #define GLX_LIB "libGLESv2.so"
+#elif defined(__RPI__)
+#define GLX_LIB "libbrcmGLESv2.so"
 #else
 #define GLX_LIB "libGL.so.1"
 #endif
@@ -189,10 +193,24 @@
 #define EGL_LIB "libEGL.dll"
 #define GLES1_LIB "libGLES_CM.dll"
 #define GLES2_LIB "libGLESv2.dll"
+#elif defined __RPI__
+#define EGL_LIB "libbrcmEGL.so"
+#define EGL_LIB_ALT "libbrcmEGL.so"
+#define GLES1_LIB "libbrcmGLESv2.so"
+#define GLES2_LIB "libbrcmGLESv2.so"
+#define GLES2_LIB_ALT "libbrcmGLESv2.so"
 #else
 #define EGL_LIB "libEGL.so.1"
 #define GLES1_LIB "libGLESv1_CM.so.1"
 #define GLES2_LIB "libGLESv2.so.2"
+#endif
+
+#if !defined(EGL_LIB_ALT)
+#define EGL_LIB_ALT NULL
+#endif
+
+#if !defined(GLES2_LIB_ALT)
+#define GLES2_LIB_ALT NULL
 #endif
 
 #ifdef __GNUC__
@@ -261,7 +279,7 @@ static struct api api = {
 #ifndef _WIN32
     .mutex = PTHREAD_MUTEX_INITIALIZER,
 #else
-	0,
+    0,
 #endif
 };
 
@@ -316,13 +334,19 @@ get_dlopen_handle(void **handle, const char *lib_name, bool exit_on_fail)
 }
 
 static void *
-do_dlsym(void **handle, const char *lib_name, const char *name,
+do_dlsym(void **handle, const char *lib_name, const char* alt_lib_name, char *name,
          bool exit_on_fail)
 {
     void *result;
+    int is_valid = 0;
     const char *error = "";
-
-    if (!get_dlopen_handle(handle, lib_name, exit_on_fail))
+    const char *valid_lib = lib_name;
+    is_valid = get_dlopen_handle(handle, valid_lib, exit_on_fail);
+    if (!is_valid && alt_lib_name) {
+        valid_lib = alt_lib_name;
+        is_valid = get_dlopen_handle(handle, valid_lib, exit_on_fail);
+    }
+    if(!is_valid)
         return NULL;
 
 #ifdef _WIN32
@@ -333,7 +357,7 @@ do_dlsym(void **handle, const char *lib_name, const char *name,
         error = dlerror();
 #endif
     if (!result && exit_on_fail) {
-        fprintf(stderr,"%s() not found in %s: %s\n", name, lib_name, error);
+        fprintf(stderr,"%s() not found in %s: %s\n", name, valid_lib, error);
         exit(1);
     }
 
@@ -534,13 +558,17 @@ epoxy_current_context_is_glx(void)
      * Presumably they dlopened with RTLD_LOCAL, which hides it
      * from us.  Just go dlopen()ing likely libraries and try them.
      */
-    sym = do_dlsym(&api.glx_handle, GLX_LIB, "glXGetCurrentContext", false);
+    sym = do_dlsym(&api.glx_handle, GLX_LIB_DEFAULT, NULL, "glXGetCurrentContext", false);
     if (sym && glXGetCurrentContext())
         return true;
 
 #if PLATFORM_HAS_EGL
-    sym = do_dlsym(&api.egl_handle, EGL_LIB, "eglGetCurrentContext",
+    sym = do_dlsym(&api.egl_handle, EGL_LIB, EGL_LIB_ALT, "eglGetCurrentContext",
                    false);
+    #ifdef EGL_LIB_ALT
+    if (!sym)
+        sym = do_dlsym(&api.egl_handle, EGL_LIB_ALT, EGL_LIB_ALT, "eglGetCurrentContext",   false);
+    #endif
     if (sym && epoxy_egl_get_current_gl_context_api() != EGL_NONE)
         return false;
 #endif /* PLATFORM_HAS_EGL */
@@ -578,7 +606,7 @@ epoxy_conservative_has_gl_extension(const char *ext)
 void *
 epoxy_conservative_egl_dlsym(const char *name, bool exit_if_fails)
 {
-    return do_dlsym(&api.egl_handle, EGL_LIB, name, exit_if_fails);
+    return do_dlsym(&api.egl_handle, EGL_LIB, EGL_LIB_ALT, name, exit_if_fails);
 }
 
 void *
@@ -590,7 +618,7 @@ epoxy_egl_dlsym(const char *name)
 void *
 epoxy_conservative_glx_dlsym(const char *name, bool exit_if_fails)
 {
-    return do_dlsym(&api.glx_handle, GLX_LIB, name, exit_if_fails);
+    return do_dlsym(&api.glx_handle, GLX_LIB, NULL, name, exit_if_fails);
 }
 
 void *
@@ -603,11 +631,11 @@ void *
 epoxy_gl_dlsym(const char *name)
 {
 #ifdef _WIN32
-    return do_dlsym(&api.gl_handle, "OPENGL32", name, true);
+    return do_dlsym(&api.gl_handle, "OPENGL32", NULL, name, true);
 #elif defined(__APPLE__)
     return do_dlsym(&api.gl_handle,
                     "/System/Library/Frameworks/OpenGL.framework/Versions/Current/OpenGL",
-                    name, true);
+                    NULL, name, true);
 #else
     /* There's no library for desktop GL support independent of GLX. */
     return epoxy_glx_dlsym(name);
@@ -620,7 +648,7 @@ epoxy_gles1_dlsym(const char *name)
     if (epoxy_current_context_is_glx()) {
         return epoxy_get_proc_address(name);
     } else {
-        return do_dlsym(&api.gles1_handle, GLES1_LIB, name, true);
+        return do_dlsym(&api.gles1_handle, GLES1_LIB, NULL, name, true);
     }
 }
 
@@ -630,7 +658,7 @@ epoxy_gles2_dlsym(const char *name)
     if (epoxy_current_context_is_glx()) {
         return epoxy_get_proc_address(name);
     } else {
-        return do_dlsym(&api.gles2_handle, GLES2_LIB, name, true);
+        return do_dlsym(&api.gles2_handle, GLES2_LIB, GLES2_LIB_ALT, name, true);
     }
 }
 
@@ -650,7 +678,7 @@ epoxy_gles3_dlsym(const char *name)
     if (epoxy_current_context_is_glx()) {
         return epoxy_get_proc_address(name);
     } else {
-        void *func = do_dlsym(&api.gles2_handle, GLES2_LIB, name, false);
+        void *func = do_dlsym(&api.gles2_handle, GLES2_LIB, GLES2_LIB_ALT, name, false);
 
         if (func)
             return func;
@@ -692,9 +720,9 @@ epoxy_egl_get_current_gl_context_api(void)
     EGLint curapi;
 
     if (eglQueryContext(eglGetCurrentDisplay(), eglGetCurrentContext(),
-			EGL_CONTEXT_CLIENT_TYPE, &curapi) == EGL_FALSE) {
-	(void)eglGetError();
-	return EGL_NONE;
+    EGL_CONTEXT_CLIENT_TYPE, &curapi) == EGL_FALSE) {
+    (void)eglGetError();
+    return EGL_NONE;
     }
 
     return (EGLenum) curapi;
